@@ -13,7 +13,9 @@ import {
   Moon,
   Sun,
   Monitor,
-  Upload
+  Upload,
+  Coins,
+  LogOut
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { MathProblem, Exam, ExamVersion, ProblemVariant } from './types';
@@ -21,6 +23,9 @@ import { parseProblems, generateVariants } from './services/gemini';
 import { generateExamPDF } from './utils/pdf';
 import { cn } from './lib/utils';
 import ReactMarkdown from 'react-markdown';
+import { supabase, isSupabaseConfigured } from './lib/supabase';
+import Auth from './components/Auth';
+import TopUpModal from './components/TopUpModal';
 
 type Theme = 'light' | 'dark' | 'system';
 
@@ -36,6 +41,62 @@ export default function App() {
   const [activeVersionIdx, setActiveVersionIdx] = useState(0);
   const [theme, setTheme] = useState<Theme>('system');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [session, setSession] = useState<any>(null);
+  const [coins, setCoins] = useState<number>(0);
+  const [showTopUp, setShowTopUp] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
+
+  useEffect(() => {
+    if (!isSupabaseConfigured) {
+      setIsInitializing(false);
+      return;
+    }
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (session) fetchProfile(session.user.id);
+      else setIsInitializing(false);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) fetchProfile(session.user.id);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const fetchProfile = async (userId: string) => {
+    try {
+      const { data, error } = await supabase
+        .from('profiles')
+        .select('coins')
+        .eq('id', userId)
+        .single();
+
+      if (error && error.code === 'PGRST116') {
+        const { data: newData, error: insertError } = await supabase
+          .from('profiles')
+          .insert([{ id: userId, coins: 10 }])
+          .select('coins')
+          .single();
+        
+        if (!insertError && newData) {
+          setCoins(newData.coins);
+        }
+      } else if (data) {
+        setCoins(data.coins);
+      }
+    } catch (err) {
+      console.error('Error fetching profile:', err);
+    } finally {
+      setIsInitializing(false);
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -97,6 +158,13 @@ export default function App() {
 
   const handleGenerate = async () => {
     if (problems.length === 0) return;
+
+    const cost = problems.length * versionCount;
+    if (coins < cost) {
+      setShowTopUp(true);
+      return;
+    }
+
     setIsGenerating(true);
     try {
       const labels = Array.from({ length: versionCount }, (_, i) => String.fromCharCode(65 + i));
@@ -113,6 +181,17 @@ export default function App() {
         versions
       });
       setActiveVersionIdx(0);
+
+      // Deduct coins
+      const newBalance = coins - cost;
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update({ coins: newBalance })
+        .eq('id', session.user.id);
+        
+      if (!updateError) {
+        setCoins(newBalance);
+      }
     } catch (error) {
       console.error(error);
     } finally {
@@ -130,8 +209,57 @@ export default function App() {
     }
   };
 
+  if (!isSupabaseConfigured) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F5F5F0] dark:bg-[#121212] p-6 transition-colors duration-200">
+        <div className="bg-white dark:bg-[#1E1E1E] p-8 rounded-3xl max-w-2xl w-full shadow-xl border border-[#1A1A1A]/10 dark:border-white/10">
+          <h2 className="text-2xl font-serif italic mb-4 dark:text-white">Supabase Configuration Required</h2>
+          <p className="text-[#1A1A1A]/70 dark:text-white/70 mb-6">
+            To enable authentication and billing, please add your Supabase credentials to the AI Studio secrets/environment variables:
+          </p>
+          <ul className="list-disc pl-5 mb-6 text-sm text-[#1A1A1A]/70 dark:text-white/70 space-y-2">
+            <li><code className="bg-[#F5F5F0] dark:bg-[#2A2A2A] px-2 py-1 rounded">VITE_SUPABASE_URL</code></li>
+            <li><code className="bg-[#F5F5F0] dark:bg-[#2A2A2A] px-2 py-1 rounded">VITE_SUPABASE_ANON_KEY</code></li>
+          </ul>
+          <div className="bg-[#F5F5F0] dark:bg-[#2A2A2A] p-4 rounded-xl text-sm overflow-x-auto">
+            <p className="font-bold mb-2 dark:text-white">Required SQL Schema:</p>
+            <pre className="text-[#1A1A1A]/70 dark:text-white/70">
+{`create table public.profiles (
+  id uuid references auth.users not null primary key,
+  coins integer default 10 not null
+);
+alter table public.profiles enable row level security;
+create policy "Users can view own profile" on profiles for select using (auth.uid() = id);
+create policy "Users can update own profile" on profiles for update using (auth.uid() = id);
+create policy "Users can insert own profile" on profiles for insert with check (auth.uid() = id);`}
+            </pre>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (isInitializing) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F5F5F0] dark:bg-[#121212] transition-colors duration-200">
+        <Loader2 className="animate-spin text-[#5A5A40] dark:text-[#8A8A60]" size={32} />
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <Auth />;
+  }
+
   return (
     <div className="min-h-screen bg-[#F5F5F0] dark:bg-[#121212] text-[#1A1A1A] dark:text-[#E0E0E0] font-sans selection:bg-[#5A5A40] selection:text-white transition-colors duration-200">
+      <TopUpModal 
+        isOpen={showTopUp} 
+        onClose={() => setShowTopUp(false)} 
+        userId={session.user.id}
+        currentCoins={coins}
+        onSuccess={setCoins}
+      />
       {/* Header */}
       <header className="border-b border-[#1A1A1A]/10 dark:border-white/10 bg-white/80 dark:bg-[#1E1E1E]/80 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -140,6 +268,16 @@ export default function App() {
             <h1 className="text-xl font-semibold tracking-tight">KindMath</h1>
           </div>
           <div className="flex items-center gap-4">
+            <div className="flex items-center gap-2 bg-[#F5F5F0] dark:bg-[#2A2A2A] px-3 py-1.5 rounded-full border border-[#1A1A1A]/5 dark:border-white/5">
+              <Coins size={14} className="text-[#5A5A40] dark:text-[#8A8A60]" />
+              <span className="text-sm font-bold dark:text-white">{coins}</span>
+              <button 
+                onClick={() => setShowTopUp(true)}
+                className="ml-2 text-[10px] font-bold uppercase tracking-widest bg-[#5A5A40] text-white px-2 py-0.5 rounded-full hover:bg-[#4A4A30] transition-colors"
+              >
+                Top Up
+              </button>
+            </div>
             <div className="flex bg-[#F5F5F0] dark:bg-[#2A2A2A] rounded-full p-1 border border-[#1A1A1A]/5 dark:border-white/5">
               {(['light', 'system', 'dark'] as Theme[]).map((t) => (
                 <button
@@ -168,6 +306,13 @@ export default function App() {
                 Download PDF
               </button>
             )}
+            <button 
+              onClick={handleLogout}
+              className="p-2 text-[#1A1A1A]/50 dark:text-white/50 hover:text-[#1A1A1A] dark:hover:text-white transition-colors"
+              title="Sign Out"
+            >
+              <LogOut size={18} />
+            </button>
           </div>
         </div>
       </header>
